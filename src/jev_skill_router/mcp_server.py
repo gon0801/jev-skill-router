@@ -29,7 +29,25 @@ ADAPTER_TOKEN = os.environ.get("JEV_SKILL_ADAPTER_TOKEN", "")
 TYPESAFE_API_KEY = os.environ.get("JEV_TYPESAFE_API_KEY", "")
 TYPESAFE_URL = (os.environ.get("JEV_TYPESAFE_URL")
                 or "https://api.typesafe.ai/v1/systemone")
-SKILLS_ROOT = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")) + "/skills"
+def _skills_root() -> str:
+    """JEV_SKILLS_ROOT > HERMES_HOME/skills > owning profile dir > ~/.hermes/skills.
+
+    The Hermes gateway does not always pass HERMES_HOME to the MCP subprocess;
+    without this the roster is empty and TypeSafe rejects the choice with 422."""
+    explicit = os.environ.get("JEV_SKILLS_ROOT")
+    if explicit:
+        return explicit
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        return home + "/skills"
+    # <perfil>/plugins/jev-skill-router-mcp/src/jev_skill_router/mcp_server.py
+    profile = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    if os.path.isdir(os.path.join(profile, "skills")):
+        return os.path.join(profile, "skills")
+    return os.path.expanduser("~/.hermes") + "/skills"
+
+
+SKILLS_ROOT = _skills_root()
 GATE_THRESHOLD = 0.30
 FITS_THRESHOLD = 0.30
 SHORTLIST = 3
@@ -157,6 +175,8 @@ def call_adapter(document: dict) -> dict:
                 "set JEV_SKILL_ADAPTER_URL + JEV_SKILL_ADAPTER_TOKEN (adapter mode) "
                 "or JEV_TYPESAFE_API_KEY (direct mode)")
         headers["Authorization"] = f"Bearer {TYPESAFE_API_KEY}"
+        # Parche local Goncloud (2026-10-18): la API de TypeSafe ahora exige "model" (HTTP 422 sin él).
+        document = {"model": os.environ.get("JEV_SKILL_MODEL", "jev-latest"), **document}
     req = urllib.request.Request(
         url,
         data=json.dumps(document).encode("utf-8"),
