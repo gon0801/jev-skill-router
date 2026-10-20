@@ -40,6 +40,35 @@ POSITIVE = {
     "opera una cadena goncloud": "goncloud-local-chains",
 }
 
+# Live calibration, claw profile, 2026-10-19 (real JEV, roster without hidden
+# folders, thresholds set to 0): request -> (skill, gate, fit of that skill).
+CALIBRATION_POSITIVE = {
+    "revisa las ordenes de Amazon de hoy": ("amazon-seller-orders", 0.863, 0.45),
+    "cierra la cadena goncloud que se quedo trabada": ("goncloud-local-chains", 0.837, 0.63),
+    "sube esta foto al navegador y llena el formulario de MercadoLibre": ("navegacion-fluida", 0.817, 0.69),
+    "entra a Odoo y dime cuantas cajas hay": ("odoo", 0.91, 0.75),
+    "crea un cron diario que me mande el resumen de ventas": ("cron-ops", 0.713, 0.80),
+    "clona todos los repos que falten en la PC": ("github", 0.873, 0.54),
+    "cambia el modelo de respaldo de Hermes a otro proveedor": ("hermes-provider-config", 0.827, 0.88),
+    "conectate por ssh al server y revisa los contenedores": ("goncloud-machines", 0.863, 0.70),
+    "haz un excel con las ventas de la semana": ("xlsx", 0.62, 0.94),
+    "lee este pdf y sacame los totales": ("pdf", 0.783, 0.78),
+    "revisa las preguntas pendientes de MercadoLibre por API": ("mercadolibre-api", 0.913, 0.81),
+    "actualiza el precio de un producto en Shopify": ("shopify-api", 0.72, 0.91),
+    "loguea el navegador en Seller Central": ("browser-vault-logins", 0.757, 0.90),
+}
+CALIBRATION_NEGATIVE = {
+    "Revisa si ya quedo?": ("recall", 0.623, 0.40),
+    "Ok avisame cuando este al 100 y limpio": ("inbox-gmail-cleanup", 0.69, 0.68),
+    "Dame lista de los problemas para que Claude lo revise": ("interrogate", 0.487, 0.29),
+    "Ok no limpies basura deja lo que copiaste limpio": ("unslop", 0.63, 0.50),
+    "Ok entonces haz lo que falta": ("recall", 0.633, 0.31),
+    "Y como arreglamos lo de los skills?": ("recall", 0.543, 0.27),
+    "Sigue sin terminar?": ("recall", 0.40, 0.63),
+}
+# The one clear request the gate cannot catch without letting negatives in.
+CALIBRATION_KNOWN_MISS = {"haz un excel con las ventas de la semana"}
+
 
 def make_root(tmp):
     for (cat, name), desc in SKILLS.items():
@@ -264,6 +293,113 @@ class PrecisionTests(unittest.TestCase):
         self.assertEqual(by["fm-skill"], "custom")
 
 
+class CalibrationTests(unittest.TestCase):
+    """Defaults (gate 0.70 / fits 0.40) against the 2026-10-19 live measurements."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        names = {v[0] for v in CALIBRATION_POSITIVE.values()}
+        names |= {v[0] for v in CALIBRATION_NEGATIVE.values()}
+        for name in names:
+            d = os.path.join(tmp.name, name)
+            os.makedirs(d)
+            with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+                fh.write(f"---\nname: {name}\ndescription: {name}.\n---\nBody.\n")
+        self.roster = ms.load_roster(tmp.name)
+        self.plan = {**CALIBRATION_POSITIVE, **CALIBRATION_NEGATIVE}
+
+    def run_case(self, request, cfg=None):
+        skill, gate, fit = self.plan[request]
+        fake = FakeJev({request: (gate, skill, fit)})
+        with mock.patch.object(ms, "call_adapter", fake):
+            return ms.suggest(request, self.roster, cfg or ms.Config(min_chars=0))
+
+    def test_positives_are_suggested_except_known_miss(self):
+        for request, (skill, _g, _f) in CALIBRATION_POSITIVE.items():
+            with self.subTest(request=request):
+                res = self.run_case(request)
+                if request in CALIBRATION_KNOWN_MISS:
+                    self.assertEqual(res["reason"], "gate_below_threshold")
+                else:
+                    self.assertEqual(res["suggested"], skill)
+
+    def test_hit_rate_is_12_of_13(self):
+        hits = sum(self.run_case(r)["suggested"] == v[0]
+                   for r, v in CALIBRATION_POSITIVE.items())
+        self.assertEqual((hits, len(CALIBRATION_POSITIVE)), (12, 13))
+
+    def test_negatives_always_abstain(self):
+        for request in CALIBRATION_NEGATIVE:
+            with self.subTest(request=request):
+                res = self.run_case(request)
+                self.assertEqual(res["decision"], "abstain")
+                self.assertIsNone(res["suggested"])
+
+    def test_previous_fits_default_abstained_on_clear_requests(self):
+        # Discriminating check: with the old fits 0.70 these four clear
+        # requests were dropped, which is what the new default fixes.
+        old = ms.Config(gate_threshold=0.70, fits_threshold=0.70, min_chars=0)
+        for request in ("revisa las ordenes de Amazon de hoy",
+                        "clona todos los repos que falten en la PC",
+                        "cierra la cadena goncloud que se quedo trabada",
+                        "sube esta foto al navegador y llena el formulario de MercadoLibre"):
+            with self.subTest(request=request):
+                res = self.run_case(request, old)
+                self.assertEqual(res["reason"], "fits_below_threshold")
+
+    def test_lowering_gate_would_let_negatives_in(self):
+        # Why the gate stays at 0.70: 0.62 recovers xlsx but admits a negative.
+        loose = ms.Config(gate_threshold=0.62, min_chars=0)
+        leaked = [r for r in CALIBRATION_NEGATIVE
+                  if self.run_case(r, loose)["decision"] == "suggest"]
+        self.assertTrue(leaked)
+
+
+class RosterWalkTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def add(self, *parts, desc="A skill."):
+        d = os.path.join(self.root, *parts)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write(f"---\nname: {parts[-1]}\ndescription: {desc}\n---\nBody.\n")
+
+    def names(self):
+        return [s["name"] for s in ms.load_roster(self.root)]
+
+    def test_hidden_and_backup_dirs_are_skipped(self):
+        self.add("github")
+        for parts in ((".archive", "multi-machine-repo-sync"), (".git", "x"),
+                      (".hub", "y"), ("_archivado", "old-skill"),
+                      ("devops", "tool.bak"), ("backup-2026", "z"),
+                      ("Backup", "w"), ("devops", ".archive", "deep")):
+            self.add(*parts)
+        self.assertEqual(self.names(), ["github"])
+
+    def test_archived_copy_does_not_shadow_live_skill(self):
+        self.add("amazon-seller-orders", desc="short")
+        self.add(".archive", "amazon-seller-orders", desc="a much longer stale description")
+        roster = ms.load_roster(self.root)
+        self.assertEqual([s["description"] for s in roster], ["short"])
+        self.assertNotIn(".archive", roster[0]["path"])
+
+    def test_root_under_hidden_parent_still_loads(self):
+        hidden_root = os.path.join(self.root, ".hermes", "skills")
+        os.makedirs(os.path.join(hidden_root, "github"))
+        with open(os.path.join(hidden_root, "github", "SKILL.md"), "w") as fh:
+            fh.write("---\nname: github\ndescription: d\n---\nB\n")
+        self.assertEqual([s["name"] for s in ms.load_roster(hidden_root)], ["github"])
+
+    def test_only_backup_prefix_is_pruned(self):
+        self.add("my-backup")
+        self.add("backups-old")
+        self.assertEqual(self.names(), ["my-backup"])
+
+
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -277,7 +413,7 @@ class ConfigTests(unittest.TestCase):
     def test_defaults(self):
         cfg = ms.load_config(env={}, home=self.home)
         self.assertEqual((cfg.gate_threshold, cfg.fits_threshold, cfg.min_chars),
-                         (0.7, 0.7, 15))
+                         (0.7, 0.4, 15))
         self.assertEqual((cfg.allow, cfg.deny), ((), ()))
 
     def test_json_file_then_env_overrides(self):
@@ -308,7 +444,7 @@ class ConfigTests(unittest.TestCase):
                                       "JEV_SKILL_FITS_THRESHOLD": "7",
                                       "JEV_SKILL_MIN_CHARS": "x"}, home=self.home)
         self.assertEqual((cfg.gate_threshold, cfg.fits_threshold, cfg.min_chars),
-                         (0.7, 0.7, 15))
+                         (0.7, 0.4, 15))
 
     def test_broken_json_is_not_fatal(self):
         with open(os.path.join(self.home, ms.CONFIG_FILENAME), "w") as fh:

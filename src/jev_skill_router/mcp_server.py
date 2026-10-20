@@ -9,8 +9,8 @@ Zwei Calls pro Anfrage (Cookbook "Skill suggestion", docs.typesafe.ai):
   selbst >= fits_threshold haben, sonst nichts.
 Output: maximal EIN Skill-Name (oder ()) + der <skill_relevance>-Block.
 
-Praezision (Defaults 0.7, konfigurierbar, siehe load_config): Gateway-
-Umschlaege werden vor der Anfrage entfernt, Nachrichten < 15 Zeichen werden
+Praezision (Defaults gate 0.70 / fits 0.40, konfigurierbar, siehe
+load_config): Gateway-Umschlaege werden vor der Anfrage entfernt, Nachrichten < 15 Zeichen werden
 uebersprungen, das Roster laesst sich per allow/deny eingrenzen, und im
 Zweifel gibt es KEINEN Vorschlag.
 
@@ -64,9 +64,10 @@ def _skills_root(env=None, module_file: str | None = None) -> str:
 
 SKILLS_ROOT = _skills_root()
 # Cookbook-Default war 0.30; gegen echte Hermes-Turns zu lax (siehe README,
-# "Precision tuning"). 0.7 = Startwert, ueber env/JSON pro Profil anpassbar.
+# "Precision tuning"). gate 0.70 / fits 0.40 = kalibriert am 2026-10-19
+# (README, "Calibration"); ueber env/JSON pro Profil anpassbar.
 DEFAULT_GATE_THRESHOLD = 0.70
-DEFAULT_FITS_THRESHOLD = 0.70
+DEFAULT_FITS_THRESHOLD = 0.40
 DEFAULT_MIN_CHARS = 15
 CONFIG_FILENAME = "jev-skill-router.json"
 SHORTLIST = 3
@@ -136,6 +137,15 @@ def _parse_frontmatter(text: str) -> dict:
     return out
 
 
+IGNORED_DIR_PATTERNS = ("_archivado", "*.bak", "backup*")
+
+
+def _is_ignored_dir(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.startswith(".") or any(
+        fnmatch.fnmatchcase(lowered, p) for p in IGNORED_DIR_PATTERNS)
+
+
 def load_roster(root: str | None = None) -> list[dict]:
     """Liest alle SKILL.md unter root (Default SKILLS_ROOT) ->
     [{name, description, category, path, body}].
@@ -145,7 +155,11 @@ def load_roster(root: str | None = None) -> list[dict]:
     followlinks=True: Top-Level-Skills sind oft Symlinks (z.B. -> ~/.claude/skills)."""
     root = root or SKILLS_ROOT
     roster = []
-    for dirpath, _dirs, files in os.walk(root, followlinks=True):
+    for dirpath, dirs, files in os.walk(root, followlinks=True):
+        # Versteckte und Backup-Ordner (.archive, .git, _archivado, *.bak,
+        # backup*) sind keine lebenden Skills; nur Namen unterhalb von root
+        # werden geprueft, root selbst darf unter einem versteckten Pfad liegen.
+        dirs[:] = [d for d in dirs if not _is_ignored_dir(d)]
         if "SKILL.md" not in files:
             continue
         path = os.path.join(dirpath, "SKILL.md")
