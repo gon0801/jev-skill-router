@@ -37,7 +37,32 @@ ADAPTER_TOKEN = os.environ.get("JEV_SKILL_ADAPTER_TOKEN", "")
 TYPESAFE_API_KEY = os.environ.get("JEV_TYPESAFE_API_KEY", "")
 TYPESAFE_URL = (os.environ.get("JEV_TYPESAFE_URL")
                 or "https://api.typesafe.ai/v1/systemone")
-SKILLS_ROOT = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")) + "/skills"
+
+
+def _skills_root(env=None, module_file: str | None = None) -> str:
+    """JEV_SKILLS_ROOT > HERMES_HOME/skills > Profil des Plugins > ~/.hermes/skills.
+
+    Der Gateway reicht HERMES_HOME nicht immer an den MCP-Subprozess durch;
+    ohne den Profil-Fallback ist das Roster leer und TypeSafe antwortet 422."""
+    env = os.environ if env is None else env
+    explicit = env.get("JEV_SKILLS_ROOT")
+    if explicit:
+        return explicit
+    home = env.get("HERMES_HOME")
+    if home:
+        return home + "/skills"
+    # <profil>/plugins/<plugin>/src/jev_skill_router/mcp_server.py
+    here = os.path.dirname(os.path.abspath(module_file or __file__))
+    plugin_dir = os.path.abspath(os.path.join(here, "..", ".."))
+    plugins_dir = os.path.dirname(plugin_dir)
+    if os.path.basename(plugins_dir) == "plugins":
+        skills = os.path.join(os.path.dirname(plugins_dir), "skills")
+        if os.path.isdir(skills):
+            return skills
+    return os.path.expanduser("~/.hermes") + "/skills"
+
+
+SKILLS_ROOT = _skills_root()
 # Cookbook-Default war 0.30; gegen echte Hermes-Turns zu lax (siehe README,
 # "Precision tuning"). 0.7 = Startwert, ueber env/JSON pro Profil anpassbar.
 DEFAULT_GATE_THRESHOLD = 0.70
@@ -297,6 +322,9 @@ def call_adapter(document: dict) -> dict:
                 "set JEV_SKILL_ADAPTER_URL + JEV_SKILL_ADAPTER_TOKEN (adapter mode) "
                 "or JEV_TYPESAFE_API_KEY (direct mode)")
         headers["Authorization"] = f"Bearer {TYPESAFE_API_KEY}"
+        # Die TypeSafe-API antwortet ohne "model" mit HTTP 422.
+        document = {"model": os.environ.get("JEV_SKILL_MODEL", "jev-latest"),
+                    **document}
     req = urllib.request.Request(
         url,
         data=json.dumps(document).encode("utf-8"),

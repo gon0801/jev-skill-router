@@ -371,5 +371,93 @@ class McpInterfaceTests(unittest.TestCase):
         self.assertIn("hermes-cron-ops", res["suggestion_block"])
 
 
+class SkillsRootTests(unittest.TestCase):
+    """_skills_root: JEV_SKILLS_ROOT > HERMES_HOME > perfil del plugin > ~/.hermes."""
+
+    def make_profile(self, with_skills=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        profile = os.path.join(tmp.name, "claw")
+        module = os.path.join(profile, "plugins", "jev-skill-router-mcp",
+                              "src", "jev_skill_router", "mcp_server.py")
+        os.makedirs(os.path.dirname(module))
+        if with_skills:
+            os.makedirs(os.path.join(profile, "skills"))
+        return profile, module
+
+    def test_explicit_root_wins_over_everything(self):
+        profile, module = self.make_profile()
+        env = {"JEV_SKILLS_ROOT": "/x/skills", "HERMES_HOME": "/h"}
+        self.assertEqual(ms._skills_root(env, module), "/x/skills")
+
+    def test_hermes_home_when_no_explicit_root(self):
+        profile, module = self.make_profile()
+        self.assertEqual(ms._skills_root({"HERMES_HOME": "/h"}, module),
+                         "/h/skills")
+
+    def test_owner_profile_when_hermes_home_missing(self):
+        profile, module = self.make_profile()
+        got = ms._skills_root({}, module)
+        self.assertEqual(os.path.normcase(os.path.abspath(got)),
+                         os.path.normcase(os.path.join(profile, "skills")))
+
+    def test_falls_back_to_home_outside_a_profile(self):
+        # Checkout normal (kein .../plugins/<plugin>/): nie das Repo-eigene skills/
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        module = os.path.join(tmp.name, "repo", "src", "jev_skill_router",
+                              "mcp_server.py")
+        os.makedirs(os.path.dirname(module))
+        os.makedirs(os.path.join(tmp.name, "skills"))
+        self.assertEqual(ms._skills_root({}, module),
+                         os.path.expanduser("~/.hermes") + "/skills")
+
+    def test_falls_back_when_profile_has_no_skills_dir(self):
+        profile, module = self.make_profile(with_skills=False)
+        self.assertEqual(ms._skills_root({}, module),
+                         os.path.expanduser("~/.hermes") + "/skills")
+
+
+class ModelPayloadTests(unittest.TestCase):
+    """Direct mode must send "model" (TypeSafe answers HTTP 422 without it)."""
+
+    def send(self, document, env=None):
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            seen["body"] = json.loads(req.data.decode("utf-8"))
+            return Resp()
+
+        with mock.patch.object(ms, "ADAPTER_URL", ""),                 mock.patch.object(ms, "TYPESAFE_API_KEY", "k"),                 mock.patch.dict(os.environ, env or {}, clear=False),                 mock.patch.object(ms.urllib.request, "urlopen", fake_urlopen):
+            if not env or "JEV_SKILL_MODEL" not in env:
+                os.environ.pop("JEV_SKILL_MODEL", None)
+            ms.call_adapter(document)
+        return seen["body"]
+
+    def test_default_model_is_sent(self):
+        body = self.send({"state": {}, "questions": []})
+        self.assertEqual(body["model"], "jev-latest")
+        self.assertEqual(body["questions"], [])
+
+    def test_env_model_overrides_default(self):
+        body = self.send({"state": {}, "questions": []},
+                         {"JEV_SKILL_MODEL": "jev-x"})
+        self.assertEqual(body["model"], "jev-x")
+
+    def test_model_in_document_is_not_overwritten(self):
+        body = self.send({"model": "mine", "state": {}, "questions": []})
+        self.assertEqual(body["model"], "mine")
+
+
 if __name__ == "__main__":
     unittest.main()
