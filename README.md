@@ -145,13 +145,11 @@ a live Hermes profile they suggested unrelated skills for chatter such as
 "Ok no limpies basura deja lo que copiaste limpio" (→ a text humanizer), and
 could name a skill that was not in the roster. Behaviour now:
 
-- **Thresholds** `gate_threshold` and `fits_threshold` default to **0.70**.
-  That is a provisional starting point, not a calibrated optimum: clear
-  matches score ≈0.9 (see examples below) while the observed false positives
-  sit in the mid range that 0.30 let through. Every response carries the
-  `gate`, `fits` and `thresholds` it used, so tune per profile from real
-  traffic. Lower them if useful requests get `abstain`; raise them if noise
-  still gets through.
+- **Thresholds** `gate_threshold` defaults to **0.70** and `fits_threshold`
+  to **0.40**, calibrated on live traffic (see [Calibration](#calibration)).
+  Every response carries the `gate`, `fits` and `thresholds` it used, so tune
+  per profile from real traffic. Lower them if useful requests get `abstain`;
+  raise them if noise still gets through.
 - **Short messages** (< `min_chars`, default 15, measured after cleaning) are
   skipped without any backend call (`reason: too_short`).
 - **Gateway wrappers are stripped** before the request is sent: lines starting
@@ -165,8 +163,57 @@ could name a skill that was not in the roster. Behaviour now:
   `$HERMES_HOME/skills` (`skills/<category>/<skill>/SKILL.md`) or a
   `category:` frontmatter field; top-level skills have no category. Filtering
   happens before call 1, so excluded skills are never sent to the backend.
+- **Roster walk** skips hidden directories (name starting with `.`, e.g.
+  `.archive`, `.git`, `.hub`) and backup folders (`_archivado`, `*.bak`,
+  `backup*`, case-insensitive), so archived copies are never suggested or
+  allowed to shadow a live skill. Only names below the skills root are
+  checked. A live skill whose *directory* starts with `backup` would be
+  skipped too; name it differently.
 - **Validation**: the returned skill must be in the (filtered) roster and its
   `SKILL.md` must still exist; otherwise `abstain`.
+
+### Calibration
+
+Measured 2026-10-19 on the live claw profile (real JEV, roster without hidden
+folders, thresholds at 0). `gate` = mean of the three gate Nouls, `fit` = the
+Noul of the skill that would be suggested. The same data is the fixture in
+`tests/test_precision.py` (`CALIBRATION_*`).
+
+| Request | Skill | gate | fit |
+|---|---|---|---|
+| revisa las ordenes de Amazon de hoy | amazon-seller-orders | 0.863 | 0.45 |
+| cierra la cadena goncloud que se quedo trabada | goncloud-local-chains | 0.837 | 0.63 |
+| sube esta foto al navegador y llena el formulario de MercadoLibre | navegacion-fluida | 0.817 | 0.69 |
+| entra a Odoo y dime cuantas cajas hay | odoo | 0.91 | 0.75 |
+| crea un cron diario que me mande el resumen de ventas | cron-ops | 0.713 | 0.80 |
+| clona todos los repos que falten en la PC | github | 0.873 | 0.54 |
+| cambia el modelo de respaldo de Hermes a otro proveedor | hermes-provider-config | 0.827 | 0.88 |
+| conectate por ssh al server y revisa los contenedores | goncloud-machines | 0.863 | 0.70 |
+| haz un excel con las ventas de la semana | xlsx | **0.62** | 0.94 |
+| lee este pdf y sacame los totales | pdf | 0.783 | 0.78 |
+| revisa las preguntas pendientes de MercadoLibre por API | mercadolibre-api | 0.913 | 0.81 |
+| actualiza el precio de un producto en Shopify | shopify-api | 0.72 | 0.91 |
+| loguea el navegador en Seller Central | browser-vault-logins | 0.757 | 0.90 |
+| *negatives (must abstain)* | | | |
+| Revisa si ya quedo? | recall | 0.623 | 0.40 |
+| Ok avisame cuando este al 100 y limpio | Limpieza de inbox Gmail | 0.69 | 0.68 |
+| Dame lista de los problemas para que Claude lo revise | interrogate | 0.487 | 0.29 |
+| Ok no limpies basura deja lo que copiaste limpio | unslop | 0.63 | 0.50 |
+| Ok entonces haz lo que falta | recall | 0.633 | 0.31 |
+| Y como arreglamos lo de los skills? | recall | 0.543 | 0.27 |
+| Sigue sin terminar? | recall | 0.40 | 0.63 |
+
+Result with gate 0.70 / fits 0.40: **12 of 13** positives suggested, **0 of 7**
+negatives. The old fits default (0.70) dropped four clear requests (Amazon
+0.45, GitHub 0.54, chains 0.63, navegacion 0.69). Caveats:
+
+- The gate is what keeps negatives out (their fits go up to 0.68), so do not
+  lower it casually: 0.62 would recover the xlsx request but admit `recall`
+  (0.623) and the inbox negative (0.69).
+- The margin is narrow: highest negative gate 0.69 vs lowest hit 0.713
+  (cron-ops), with the threshold at 0.70. Sample is 20 requests from one
+  profile; re-measure before moving either threshold.
+- The xlsx request (gate 0.62) is a known miss.
 
 ### Configuration
 
@@ -177,7 +224,7 @@ Precedence: environment variable > JSON file > default. The JSON file is
 ```json
 {
   "gate_threshold": 0.7,
-  "fits_threshold": 0.7,
+  "fits_threshold": 0.4,
   "min_chars": 15,
   "allow": ["category:devops", "amazon-*", "goncloud-local-chains"],
   "deny": ["category:creative", "category:media"]
@@ -187,7 +234,7 @@ Precedence: environment variable > JSON file > default. The JSON file is
 | Setting | Env var | Default |
 |---|---|---|
 | `gate_threshold` | `JEV_SKILL_GATE_THRESHOLD` | 0.7 |
-| `fits_threshold` | `JEV_SKILL_FITS_THRESHOLD` | 0.7 |
+| `fits_threshold` | `JEV_SKILL_FITS_THRESHOLD` | 0.4 |
 | `min_chars` | `JEV_SKILL_MIN_CHARS` | 15 |
 | `allow` | `JEV_SKILL_ALLOW` (comma-separated) | empty (all) |
 | `deny` | `JEV_SKILL_DENY` (comma-separated) | empty |
@@ -209,8 +256,9 @@ python -m unittest discover -s tests -v
 ```
 
 No network: the backend call is faked. The suite covers the six real false
-positives, clear positives, wrapper stripping, allow/deny, config precedence
-and the unchanged MCP tool schema.
+positives, the 20-request calibration fixture, the roster walk (hidden and
+backup folders), wrapper stripping, allow/deny, config precedence and the
+unchanged MCP tool schema.
 
 ## Example results
 
