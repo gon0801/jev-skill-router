@@ -26,9 +26,15 @@ saves 5–15k characters of context ballast; each wrong one wastes a turn.
 1. **Rank + gate** — one `Choice` question over ALL skill names (criteria =
    the index description) plus 3 `Noul` gates asking whether the turn wants
    an action at all (`acts_on_user_system`, `would_follow_documented_procedure`,
-   inverted `prose_suffices`). Gate mean < 0.30 → suggest nothing.
+   inverted `prose_suffices`). Gate mean < `gate_threshold` → suggest nothing.
 2. **Rerank** — the top-3 candidates return with their FULL description +
-   700 chars of `SKILL.md`, one `fits`-Noul each (all < 0.30 → abstain).
+   700 chars of `SKILL.md`, one `fits`-Noul each. The winner must be one of
+   the candidates (hence in the roster) and its own `fits` must reach
+   `fits_threshold`, otherwise → abstain. There is no fallback to "the first
+   candidate": when in doubt the answer is "no skill".
+
+Before call 1 the request is cleaned and may be skipped, see
+[Precision tuning](#precision-tuning).
 
 The winner's name goes into a `<skill_relevance>` block the caller can put
 AFTER the skill roster — the roster itself stays byte-stable, so prefix
@@ -43,9 +49,14 @@ descriptions are parsed, category/top-level duplicates are deduped.
 
 ```
 mcp__jev_skill_router__skill_select(request: str)
-→ {decision: suggest|abstain, suggested: str|null, gate, gate_values,
-   shortlist, fits, suggestion_block, usage_call1, usage_call2, seconds}
+→ {decision: suggest|abstain, suggested: str|null, reason, thresholds,
+   gate, gate_values, shortlist, fits, suggestion_block,
+   usage_call1, usage_call2, seconds}
 ```
+
+`reason` explains the decision: `ok`, `too_short`, `empty_roster`,
+`no_ranking`, `gate_below_threshold`, `no_candidates`, `invalid_winner`,
+`fits_below_threshold`, `skill_missing`. Tool name and argument are unchanged.
 
 ## Setup
 
@@ -123,6 +134,74 @@ Adapter mode wins when `JEV_SKILL_ADAPTER_URL` is set. Works with any
 endpoint that forwards `{state, questions}` to the TypeSafe Decisions API
 (`api.typesafe.ai/v1/systemone`) and returns the raw answer.
 
+## Precision tuning
+
+The cookbook defaults (0.30 / 0.30, whole catalog, raw text) are generous. On
+a live Hermes profile they suggested unrelated skills for chatter such as
+"Revisa si ya quedo?" (→ a reminders skill), "Listo" (→ getting started) or
+"Ok no limpies basura deja lo que copiaste limpio" (→ a text humanizer), and
+could name a skill that was not in the roster. Behaviour now:
+
+- **Thresholds** `gate_threshold` and `fits_threshold` default to **0.70**.
+  That is a provisional starting point, not a calibrated optimum: clear
+  matches score ≈0.9 (see examples below) while the observed false positives
+  sit in the mid range that 0.30 let through. Every response carries the
+  `gate`, `fits` and `thresholds` it used, so tune per profile from real
+  traffic. Lower them if useful requests get `abstain`; raise them if noise
+  still gets through.
+- **Short messages** (< `min_chars`, default 15, measured after cleaning) are
+  skipped without any backend call (`reason: too_short`).
+- **Gateway wrappers are stripped** before the request is sent: lines starting
+  with `JEV skill_select:` / `Jev sugiere:` / `Jev cierre:` and the bracketed
+  `[Replying to: …]`, `[The user sent …]`, `[System note: …]`, `[Telegram …]`.
+  Other text (including other `[brackets]`) is left alone; if nothing is left
+  the original request is used.
+- **Roster scoping** with `allow` / `deny`. Entries are skill names or
+  `category:<name>` (glob patterns, case-insensitive). `allow` empty = every
+  skill; `deny` always wins. Category is the first directory under
+  `$HERMES_HOME/skills` (`skills/<category>/<skill>/SKILL.md`) or a
+  `category:` frontmatter field; top-level skills have no category. Filtering
+  happens before call 1, so excluded skills are never sent to the backend.
+- **Validation**: the returned skill must be in the (filtered) roster and its
+  `SKILL.md` must still exist; otherwise `abstain`.
+
+### Configuration
+
+Precedence: environment variable > JSON file > default. The JSON file is
+`$JEV_SKILL_ROUTER_CONFIG` if set, else `$HERMES_HOME/jev-skill-router.json`
+(a per-profile file, since `HERMES_HOME` is per profile):
+
+```json
+{
+  "gate_threshold": 0.7,
+  "fits_threshold": 0.7,
+  "min_chars": 15,
+  "allow": ["category:devops", "amazon-*", "goncloud-local-chains"],
+  "deny": ["category:creative", "category:media"]
+}
+```
+
+| Setting | Env var | Default |
+|---|---|---|
+| `gate_threshold` | `JEV_SKILL_GATE_THRESHOLD` | 0.7 |
+| `fits_threshold` | `JEV_SKILL_FITS_THRESHOLD` | 0.7 |
+| `min_chars` | `JEV_SKILL_MIN_CHARS` | 15 |
+| `allow` | `JEV_SKILL_ALLOW` (comma-separated) | empty (all) |
+| `deny` | `JEV_SKILL_DENY` (comma-separated) | empty |
+
+Invalid values are ignored with a warning on stderr. Config and roster are
+read once per session, like the roster.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+No network: the backend call is faked. The suite covers the six real false
+positives, clear positives, wrapper stripping, allow/deny, config precedence
+and the unchanged MCP tool schema.
+
 ## Example results
 
 Paraphrases with zero lexical overlap with the skill name:
@@ -136,7 +215,8 @@ Paraphrases with zero lexical overlap with the skill name:
 
 - Model: `jev-latest` via the Decisions API (`system_one`). Two calls are
   the cookbook shape; the first call's ranking carries most of the value.
-- Thresholds (0.30/0.30) and SHORTLIST=3 follow the cookbook defaults.
+- SHORTLIST=3 follows the cookbook; the thresholds are stricter than its
+  0.30/0.30 defaults (see Precision tuning).
 - Works for any MCP host, not just Hermes: the roster path and the tool
   schema are the only Hermes-specific parts.
 
