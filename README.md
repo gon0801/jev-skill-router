@@ -41,8 +41,11 @@ AFTER the skill roster — the roster itself stays byte-stable, so prefix
 caching holds. An `abstain` is a valid answer; the agent keeps its own
 judgement ("Ignore this if it does not fit what the user actually asked for").
 
-The roster loads live from `$HERMES_HOME/skills` per session — never
-hardcoded. Symlinked skills are followed, block-scalar (`>` / `|`)
+The roster loads live per session — never hardcoded — from the first of:
+`$JEV_SKILLS_ROOT`, `$HERMES_HOME/skills`, the `skills/` folder of the profile
+that owns the plugin (`<profile>/plugins/<plugin>/…`, for gateways that don't
+pass `HERMES_HOME` to the MCP subprocess), then `~/.hermes/skills`. Symlinked skills are followed,
+block-scalar (`>` / `|`)
 descriptions are parsed, category/top-level duplicates are deduped.
 
 ## Tool
@@ -188,6 +191,13 @@ Precedence: environment variable > JSON file > default. The JSON file is
 | `min_chars` | `JEV_SKILL_MIN_CHARS` | 15 |
 | `allow` | `JEV_SKILL_ALLOW` (comma-separated) | empty (all) |
 | `deny` | `JEV_SKILL_DENY` (comma-separated) | empty |
+
+Two more environment variables (not in the JSON file):
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `JEV_SKILLS_ROOT` | Skills directory to scan; overrides `HERMES_HOME` | see resolution order above |
+| `JEV_SKILL_MODEL` | `model` sent to the TypeSafe API in direct mode (the API answers HTTP 422 without it) | `jev-latest` |
 
 Invalid values are ignored with a warning on stderr. Config and roster are
 read once per session, like the roster.
