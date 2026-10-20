@@ -3,10 +3,16 @@
 Zwei Calls pro Anfrage (Cookbook "Skill suggestion", docs.typesafe.ai):
   Call 1 rankt das komplette Roster (Choice ueber alle Skill-Namen, Kriterium
   = Index-Beschreibung) + 3 Noul-Gates ("will der Turn ueberhaupt ein Skill?").
-  Gate-Mittel < 0.30 -> nichts vorschlagen, Call 2 entfaellt.
+  Gate-Mittel < gate_threshold -> nichts vorschlagen, Call 2 entfaellt.
   Call 2 rerankt die Top-3 mit VOLLER Beschreibung + SKILL.md-Anfang (700 Z.)
-  und einem fits-Noul je Kandidat; alle fits < 0.30 -> nichts.
+  und einem fits-Noul je Kandidat; der Gewinner muss im Roster stehen und
+  selbst >= fits_threshold haben, sonst nichts.
 Output: maximal EIN Skill-Name (oder ()) + der <skill_relevance>-Block.
+
+Praezision (Defaults 0.7, konfigurierbar, siehe load_config): Gateway-
+Umschlaege werden vor der Anfrage entfernt, Nachrichten < 15 Zeichen werden
+uebersprungen, das Roster laesst sich per allow/deny eingrenzen, und im
+Zweifel gibt es KEINEN Vorschlag.
 
 Roster: dynamisch aus dem Hermes-Skill-Index (nie hardcoden). Der Server
 liest alle SKILL.md-Frontmatters des aktiven Profils und haelt den Stand
@@ -15,12 +21,14 @@ cache-safe, wie beim Router-Toolset ueblich).
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import sys
 import time
 import urllib.request
+from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 
 ADAPTER_URL = (os.environ.get("JEV_SKILL_ADAPTER_URL") or "").rstrip("/")
@@ -30,8 +38,12 @@ TYPESAFE_API_KEY = os.environ.get("JEV_TYPESAFE_API_KEY", "")
 TYPESAFE_URL = (os.environ.get("JEV_TYPESAFE_URL")
                 or "https://api.typesafe.ai/v1/systemone")
 SKILLS_ROOT = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")) + "/skills"
-GATE_THRESHOLD = 0.30
-FITS_THRESHOLD = 0.30
+# Cookbook-Default war 0.30; gegen echte Hermes-Turns zu lax (siehe README,
+# "Precision tuning"). 0.7 = Startwert, ueber env/JSON pro Profil anpassbar.
+DEFAULT_GATE_THRESHOLD = 0.70
+DEFAULT_FITS_THRESHOLD = 0.70
+DEFAULT_MIN_CHARS = 15
+CONFIG_FILENAME = "jev-skill-router.json"
 SHORTLIST = 3
 EXCERPT_CHARS = 700
 
@@ -68,7 +80,7 @@ _FM_DESC = re.compile(r"^description:\s*(.+)$", re.M)
 
 
 def _parse_frontmatter(text: str) -> dict:
-    """Minimal-Frontmatter-Parser: name, description (inkl. > und | Block-Skalarare), category."""
+    """Minimal-Frontmatter-Parser: name, description (inkl. > und | Block-Skalare), category."""
     if not text.startswith("---"):
         return {}
     end = text.find("\n---", 3)
@@ -79,7 +91,7 @@ def _parse_frontmatter(text: str) -> dict:
     i = 0
     while i < len(fm_lines):
         line = fm_lines[i]
-        m = re.match(r"^(name|description):\s*(.*)$", line)
+        m = re.match(r"^(name|description|category):\s*(.*)$", line)
         if not m:
             i += 1
             continue
@@ -99,25 +111,33 @@ def _parse_frontmatter(text: str) -> dict:
     return out
 
 
-def load_roster() -> list[dict]:
-    """Liest alle SKILL.md unter SKILLS_ROOT -> [{name, description, path, body}].
+def load_roster(root: str | None = None) -> list[dict]:
+    """Liest alle SKILL.md unter root (Default SKILLS_ROOT) ->
+    [{name, description, category, path, body}].
 
+    category = Frontmatter-Wert, sonst das erste Verzeichnis unter root
+    (skills/<category>/<skill>/SKILL.md); Top-Level-Skills haben "".
     followlinks=True: Top-Level-Skills sind oft Symlinks (z.B. -> ~/.claude/skills)."""
+    root = root or SKILLS_ROOT
     roster = []
-    for dirpath, _dirs, files in os.walk(SKILLS_ROOT, followlinks=True):
+    for dirpath, _dirs, files in os.walk(root, followlinks=True):
         if "SKILL.md" not in files:
             continue
         path = os.path.join(dirpath, "SKILL.md")
         try:
-            text = open(path, encoding="utf-8", errors="replace").read()
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
         except OSError:
             continue
         fm = _parse_frontmatter(text)
         name = fm.get("name") or os.path.basename(dirpath)
         body = text.split("---", 2)[-1] if text.startswith("---") else text
+        rel = os.path.relpath(dirpath, root).replace(os.sep, "/").split("/")
+        dir_category = rel[0] if len(rel) > 1 else ""
         entry = {
             "name": name,
             "description": fm.get("description", ""),
+            "category": fm.get("category") or dir_category,
             "path": path,
             "body": body.strip(),
         }
@@ -133,6 +153,126 @@ def load_roster() -> list[dict]:
         roster.append(entry)
     roster.sort(key=lambda s: s["name"])
     return roster
+
+
+# ---------------------------------------------------------------- config
+
+@dataclass(frozen=True)
+class Config:
+    gate_threshold: float = DEFAULT_GATE_THRESHOLD
+    fits_threshold: float = DEFAULT_FITS_THRESHOLD
+    min_chars: int = DEFAULT_MIN_CHARS
+    allow: tuple = ()   # leer = alle Skills; sonst nur Treffer
+    deny: tuple = ()    # gewinnt immer gegen allow
+
+
+def _warn(msg: str) -> None:
+    print(f"jev-skill-router: {msg}", file=sys.stderr)
+
+
+def _as_threshold(raw, name: str, default: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        _warn(f"ignoring invalid {name}={raw!r}")
+        return default
+    if not 0.0 <= value <= 1.0:
+        _warn(f"ignoring out-of-range {name}={raw!r} (need 0..1)")
+        return default
+    return value
+
+
+def _as_patterns(raw) -> tuple:
+    if raw is None:
+        return ()
+    items = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)):
+        return ()
+    return tuple(str(i).strip() for i in items if str(i).strip())
+
+
+def load_config(env=None, home: str | None = None) -> Config:
+    """Prioritaet: env > JSON-Datei > Default.
+
+    JSON: $JEV_SKILL_ROUTER_CONFIG, sonst $HERMES_HOME/jev-skill-router.json
+    (Keys: gate_threshold, fits_threshold, min_chars, allow, deny).
+    env: JEV_SKILL_GATE_THRESHOLD, JEV_SKILL_FITS_THRESHOLD,
+    JEV_SKILL_MIN_CHARS, JEV_SKILL_ALLOW, JEV_SKILL_DENY (kommagetrennt).
+    Ungueltige Werte werden ignoriert (Warnung auf stderr), nie fatal."""
+    env = os.environ if env is None else env
+    home = home or env.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    path = env.get("JEV_SKILL_ROUTER_CONFIG") or os.path.join(home, CONFIG_FILENAME)
+    data: dict = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                _warn(f"{path}: expected a JSON object, ignoring")
+        except (OSError, ValueError) as exc:
+            _warn(f"cannot read {path}: {exc}")
+
+    def pick(env_key: str, json_key: str):
+        return env[env_key] if env.get(env_key) not in (None, "") else data.get(json_key)
+
+    gate = pick("JEV_SKILL_GATE_THRESHOLD", "gate_threshold")
+    fits = pick("JEV_SKILL_FITS_THRESHOLD", "fits_threshold")
+    min_chars = pick("JEV_SKILL_MIN_CHARS", "min_chars")
+    try:
+        min_chars = DEFAULT_MIN_CHARS if min_chars is None else max(0, int(min_chars))
+    except (TypeError, ValueError):
+        _warn(f"ignoring invalid min_chars={min_chars!r}")
+        min_chars = DEFAULT_MIN_CHARS
+    return Config(
+        gate_threshold=DEFAULT_GATE_THRESHOLD if gate is None
+        else _as_threshold(gate, "gate_threshold", DEFAULT_GATE_THRESHOLD),
+        fits_threshold=DEFAULT_FITS_THRESHOLD if fits is None
+        else _as_threshold(fits, "fits_threshold", DEFAULT_FITS_THRESHOLD),
+        min_chars=min_chars,
+        allow=_as_patterns(pick("JEV_SKILL_ALLOW", "allow")),
+        deny=_as_patterns(pick("JEV_SKILL_DENY", "deny")),
+    )
+
+
+def _matches(pattern: str, skill: dict) -> bool:
+    """`category:<glob>` prueft die Kategorie, alles andere den Skill-Namen
+    (fnmatch, case-insensitive)."""
+    pattern = pattern.lower()
+    if pattern.startswith("category:"):
+        return fnmatch.fnmatchcase((skill.get("category") or "").lower(),
+                                   pattern[len("category:"):])
+    return fnmatch.fnmatchcase(skill["name"].lower(), pattern)
+
+
+def filter_roster(roster: list[dict], cfg: Config) -> list[dict]:
+    """allow (leer = alle) einschraenken, dann deny abziehen."""
+    return [
+        s for s in roster
+        if (not cfg.allow or any(_matches(p, s) for p in cfg.allow))
+        and not any(_matches(p, s) for p in cfg.deny)
+    ]
+
+
+# ---------------------------------------------------------------- request cleaning
+
+# Gateway-Zeilen aus frueheren Vorschlaegen/Abschluessen.
+_WRAPPER_LINE = re.compile(
+    r"^[ \t]*(?:JEV skill_select|Jev sugiere|Jev cierre):.*$", re.I | re.M)
+# Eckige Umschlaege des Gateways; bewusst nur diese vier Tags, damit echter
+# Nutzertext in [..] (z.B. "[ ] tarea") nie verschwindet.
+_WRAPPER_BRACKET = re.compile(
+    r"\[(?:Replying to|The user sent|System note|Telegram)\b[^\]]*\]", re.I)
+
+
+def clean_request(text: str) -> str:
+    """Entfernt Gateway-Umschlaege; bleibt nichts uebrig, gilt das Original."""
+    original = text.strip()
+    cleaned = _WRAPPER_LINE.sub(" ", original)
+    cleaned = _WRAPPER_BRACKET.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or original
 
 
 # ---------------------------------------------------------------- adapter
@@ -175,10 +315,26 @@ def call_adapter(document: dict) -> dict:
 
 # ---------------------------------------------------------------- suggest
 
-def suggest(request: str, roster: list[dict]) -> dict:
-    """Cookbook suggest(): zwei Calls, zwei Schwellen, max. ein Skill-Name."""
+def suggest(request: str, roster: list[dict], cfg: Config | None = None) -> dict:
+    """Cookbook suggest(): zwei Calls, zwei Schwellen, max. ein Skill-Name.
+
+    Im Zweifel abstain; result["reason"] sagt warum."""
+    cfg = cfg or Config()
     by_name = {s["name"]: s for s in roster}
+    request = clean_request(request)
     state = {"request": request, "recent_context": ""}
+    result = {
+        "roster_size": len(roster),
+        "thresholds": {"gate": cfg.gate_threshold, "fits": cfg.fits_threshold},
+        "suggested": None,
+        "decision": "abstain",
+    }
+    if len(request) < cfg.min_chars:
+        result["reason"] = "too_short"
+        return result
+    if not roster:
+        result["reason"] = "empty_roster"
+        return result
 
     # ---- Call 1: Choice-Ranking + Gates (ein Round-Trip)
     questions = {
@@ -202,22 +358,21 @@ def suggest(request: str, roster: list[dict]) -> dict:
     oriented = [(1.0 - v) if k in INVERTED else v for k, v in values.items()]
     gate = sum(oriented) / len(oriented) if oriented else 0.0
 
-    result = {
-        "roster_size": len(roster),
-        "gate": round(gate, 3),
-        "gate_values": {k: round(v, 3) for k, v in values.items()},
-        "suggested": None,
-        "usage_call1": resp.get("usage") or {},
-    }
-    if gate < GATE_THRESHOLD or not ranked:
-        result["decision"] = "abstain"
+    result["gate"] = round(gate, 3)
+    result["gate_values"] = {k: round(v, 3) for k, v in values.items()}
+    result["usage_call1"] = resp.get("usage") or {}
+    if not ranked:
+        result["reason"] = "no_ranking"
+        return result
+    if gate < cfg.gate_threshold:
+        result["reason"] = "gate_below_threshold"
         return result
 
     # ---- Call 2: Rerank Top-3 mit voller Beschreibung + Body-Exzerpt
     shortlist = tuple(name for name, _p in ranked[:SHORTLIST] if name in by_name)
     result["shortlist"] = shortlist
     if not shortlist:
-        result["decision"] = "abstain"
+        result["reason"] = "no_candidates"
         return result
     questions2 = {
         "which": {
@@ -246,11 +401,20 @@ def suggest(request: str, roster: list[dict]) -> dict:
     winner = (answers2.get("which") or {}).get("choice")
     result["fits"] = {k: round(v, 3) for k, v in fits.items()}
     result["usage_call2"] = resp2.get("usage") or {}
-    if not fits or max(fits.values()) < FITS_THRESHOLD:
-        result["decision"] = "abstain"
+    # Kein Fallback auf shortlist[0]: ein Gewinner ausserhalb der Shortlist
+    # (= ausserhalb des Rosters) ist Zweifel, also nichts.
+    if winner not in shortlist:
+        result["reason"] = "invalid_winner"
+        return result
+    if fits.get(winner, 0.0) < cfg.fits_threshold:
+        result["reason"] = "fits_below_threshold"
+        return result
+    if not os.path.isfile(by_name[winner]["path"]):
+        result["reason"] = "skill_missing"  # seit Session-Start verschwunden
         return result
     result["decision"] = "suggest"
-    result["suggested"] = winner if winner in by_name else shortlist[0]
+    result["reason"] = "ok"
+    result["suggested"] = winner
     return result
 
 
@@ -283,6 +447,7 @@ def _read() -> dict:
 
 def serve_stdio() -> None:
     roster = None  # lazy: erst beim ersten skill_select
+    cfg = None
     while True:
         try:
             msg = _read()
@@ -335,9 +500,10 @@ def serve_stdio() -> None:
                 continue
             try:
                 if roster is None:
-                    roster = load_roster()
+                    cfg = load_config()
+                    roster = filter_roster(load_roster(), cfg)
                 started = time.perf_counter()
-                res = suggest(request_text, roster)
+                res = suggest(request_text, roster, cfg)
                 res["seconds"] = round(time.perf_counter() - started, 2)
                 res["suggestion_block"] = suggestion_block(res.get("suggested"))
                 _write({"jsonrpc": "2.0", "id": msg_id, "result": {
