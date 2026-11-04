@@ -281,3 +281,4 @@ Paraphrases with zero lexical overlap with the skill name:
 ## License
 
 MIT
+<!-- comprobado por el motor de encargos, Mac.lan, 2026-11-03 -->
