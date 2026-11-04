@@ -1,0 +1,16 @@
+[project]
+name = "jev-skill-router"
+version = "0.1.0"
+description = "Skill suggestion for Hermes via the TypeSafe cookbook pattern (Jev): one Choice call ranks the roster + gates, a second reranks the top candidates with full descriptions. Suggests at most one skill name."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+jev-skill-router = "jev_skill_router.mcp_server:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jev_skill_router"]
