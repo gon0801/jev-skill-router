@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "jev-skill-router": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "${PLUGIN_ROOT}",
+        "jev-skill-router",
+        "mcp"
+      ],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {
+        "JEV_TYPESAFE_API_KEY": "${JEV_TYPESAFE_API_KEY}"
+      }
+    }
+  }
+}
